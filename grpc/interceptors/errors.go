@@ -26,16 +26,15 @@ type Config struct {
 }
 
 func NewErrorsInterceptor(config Config) *ErrorsInterceptor {
+	logger := config.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	interceptor := &ErrorsInterceptor{
 		appCodeToGrpcStatusMappings: config.AppCodeToGrpcStatusMappings,
 		domain:                      config.Domain,
-		logger:                      config.Logger,
-	}
-
-	if config.Logger != nil {
-		interceptor.logger = config.Logger
-	} else {
-		interceptor.logger = slog.Default()
+		logger:                      logger,
 	}
 
 	return interceptor
@@ -86,12 +85,11 @@ func (i *ErrorsInterceptor) buildStatusWithDetails(
 	// Добавляем ErrorInfo
 	withInfo, err := st.WithDetails(
 		&errdetails.ErrorInfo{
+			Reason: strconv.Itoa(appErr.Code()),
 			Domain: i.domain,
-			Metadata: map[string]string{
-				"code": strconv.Itoa(appErr.Code()),
-			},
 		},
 	)
+
 	if err != nil {
 		// Если не удалось добавить детали — возвращаем хотя бы статус
 		return st.Err()
