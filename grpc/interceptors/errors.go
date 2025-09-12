@@ -129,3 +129,47 @@ func httpToGRPCCode(httpCode int) codes.Code {
 		return codes.Unknown
 	}
 }
+
+// GRPCErrorInfo содержит разбор ошибки с сервера
+type GRPCErrorInfo struct {
+	GRPCCode    codes.Code
+	AppCode     int
+	Message     string
+	ErrorDomain string
+}
+
+func ExtractGRPCError(err error) (*GRPCErrorInfo, bool) {
+	if err == nil {
+		return nil, false
+	}
+
+	st, ok := status.FromError(err)
+	if !ok {
+		// не gRPC ошибка
+		return nil, false
+	}
+
+	info := &GRPCErrorInfo{
+		GRPCCode: st.Code(),
+		Message:  st.Message(),
+	}
+
+	// пытаемся найти ErrorInfo
+	for _, detail := range st.Details() {
+		if ei, ok := detail.(*errdetails.ErrorInfo); ok {
+			info.AppCode = parseAppCode(ei.Reason)
+			info.ErrorDomain = ei.Domain
+			break
+		}
+	}
+
+	return info, true
+}
+
+func parseAppCode(reason string) int {
+	code, err := strconv.Atoi(reason)
+	if err != nil {
+		return 0
+	}
+	return code
+}
