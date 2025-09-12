@@ -57,7 +57,7 @@ func (i *ErrorsInterceptor) Interceptor() grpc.UnaryServerInterceptor {
 			return nil, i.buildStatusWithDetails(appErr, info.FullMethod)
 		}
 
-		unknownErr := apperror.InternalServerError.Wrap(err)
+		unknownErr := apperror.ErrInternalServerError.Wrap(err)
 
 		return nil, i.buildStatusWithDetails(unknownErr, info.FullMethod)
 	}
