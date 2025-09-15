@@ -173,3 +173,13 @@ func parseAppCode(reason string) int {
 	}
 	return code
 }
+
+func ExtractAppError(err error) (*apperror.ApplicationError, bool) {
+	info, ok := ExtractGRPCError(err)
+
+	if !ok {
+		return nil, false
+	}
+
+	return apperror.New(info.AppCode, 0, info.Message, "", nil), true
+}
