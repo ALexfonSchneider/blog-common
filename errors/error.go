@@ -62,3 +62,12 @@ func (e *ApplicationError) Detail() string {
 func (e *ApplicationError) Cause() error {
 	return e.cause
 }
+
+func (e *ApplicationError) Is(target error) bool {
+	switch v := target.(type) {
+	case *ApplicationError:
+		return e.code == v.code
+	default:
+		return e.String() == target.Error()
+	}
+}
