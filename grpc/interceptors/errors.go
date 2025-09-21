@@ -133,18 +133,10 @@ func first(arr []string) string {
 	return ""
 }
 
-func ExtractAppError(ctx context.Context, err error) *apperror.ApplicationError {
+func ExtractAppErrorFromError(err error) *apperror.ApplicationError {
 	st, ok := status.FromError(err)
 	if !ok {
 		return apperror.New(5000, err.Error(), "")
-	}
-
-	// --- 1. Попытка достать metadata ---
-	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		code, _ := strconv.Atoi(first(md["app-code"]))
-		message := first(md["app-message"])
-		detail := first(md["app-detail"])
-		return apperror.New(code, message, detail)
 	}
 
 	var (
@@ -162,6 +154,23 @@ func ExtractAppError(ctx context.Context, err error) *apperror.ApplicationError 
 		case *errdetails.DebugInfo:
 			detail = info.Detail
 		}
+	}
+
+	if code == 0 {
+		return apperror.ErrInternalServerError.Wrap(err)
+	}
+
+	return apperror.New(code, message, detail)
+}
+
+func ExtractAppErrorFromHeader(md metadata.MD, err error) *apperror.ApplicationError {
+	//--- 1. Попытка достать metadata ---
+	code, _ := strconv.Atoi(first(md["app-code"]))
+	message := first(md["app-message"])
+	detail := first(md["app-detail"])
+
+	if code == 0 {
+		return apperror.ErrInternalServerError.Wrap(err)
 	}
 
 	return apperror.New(code, message, detail)
