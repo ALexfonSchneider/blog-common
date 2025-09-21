@@ -2,21 +2,22 @@ package interceptors
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	apperror "github.com/ALexfonSchneider/blog-common/errors"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/protoadapt"
 	"log/slog"
 	"strconv"
 )
 
 type ErrorsInterceptor struct {
-	appCodeToGrpcStatusMappings map[int]codes.Code
-	domain                      string
-	logger                      *slog.Logger
+	appCodeToGrpcStatus map[int]codes.Code
+	domain              string
+	logger              *slog.Logger
 }
 
 type Config struct {
@@ -32,9 +33,9 @@ func NewErrorsInterceptor(config Config) *ErrorsInterceptor {
 	}
 
 	interceptor := &ErrorsInterceptor{
-		appCodeToGrpcStatusMappings: config.AppCodeToGrpcStatusMappings,
-		domain:                      config.Domain,
-		logger:                      logger,
+		appCodeToGrpcStatus: config.AppCodeToGrpcStatusMappings,
+		domain:              config.Domain,
+		logger:              logger,
 	}
 
 	return interceptor
@@ -52,134 +53,116 @@ func (i *ErrorsInterceptor) Interceptor() grpc.UnaryServerInterceptor {
 			return resp, nil
 		}
 
-		var appErr *apperror.ApplicationError
-		if errors.As(err, &appErr) {
-			return nil, i.buildStatusWithDetails(appErr, info.FullMethod)
+		appErr, ok := err.(*apperror.ApplicationError)
+		if !ok {
+			appErr = apperror.New(5000, "Internal server error", "").Wrap(err)
 		}
 
-		unknownErr := apperror.ErrInternalServerError.Wrap(err)
+		var (
+			errCode    = appErr.Code()
+			errMessage = appErr.Message()
+			errDetail  = appErr.Detail()
+			errCause   = appErr.Cause()
 
-		return nil, i.buildStatusWithDetails(unknownErr, info.FullMethod)
+			errCodeStr = strconv.Itoa(errCode)
+			grpcCode   = i.getGRPCCode(errCode)
+		)
+
+		i.logger.Error("gRPC handler error",
+			"method", info.FullMethod,
+			"app_code", errCode,
+			"grpc_code", grpcCode,
+			"message", errMessage,
+			"detail", errDetail,
+			"cause", errCause,
+		)
+
+		md := metadata.Pairs(
+			"app-code", errCodeStr,
+			"app-message", errMessage,
+			"app-detail", errDetail,
+		)
+		if err = grpc.SendHeader(ctx, md); err != nil {
+			return nil, err
+		}
+
+		st := status.New(grpcCode, errMessage)
+
+		details := []protoadapt.MessageV1{
+			&errdetails.ErrorInfo{
+				Reason: fmt.Sprintf("APP_ERROR_%s", errCodeStr),
+				Domain: i.domain,
+				Metadata: map[string]string{
+					"app-code":    errCodeStr,
+					"app-message": errMessage,
+				},
+			},
+		}
+
+		if errDetail != "" || errCause != nil {
+			debug := &errdetails.DebugInfo{
+				Detail: appErr.Detail(),
+			}
+			if errCause != nil {
+				debug.StackEntries = []string{errCause.Error()}
+			}
+
+			details = append(details, debug)
+		}
+
+		stWithDetails, sErr := st.WithDetails(details...)
+		if sErr != nil {
+			return nil, st.Err()
+		}
+
+		return nil, stWithDetails.Err()
 	}
 }
 
-func (i *ErrorsInterceptor) buildStatusWithDetails(
-	appErr *apperror.ApplicationError,
-	method string,
-) error {
-	// Определяем gRPC код
-	grpcCode, ok := i.appCodeToGrpcStatusMappings[appErr.Code()]
-	if !ok {
-		grpcCode = httpToGRPCCode(appErr.HttpCode())
+func (i *ErrorsInterceptor) getGRPCCode(appCode int) codes.Code {
+	if code, ok := i.appCodeToGrpcStatus[appCode]; ok {
+		return code
 	}
-
-	// Формируем сообщение
-	msg := appErr.Message()
-	if appErr.Detail() != "" {
-		msg = fmt.Sprintf("%s: %s", appErr.Message(), appErr.Detail())
-	}
-
-	// Создаём статус
-	st := status.New(grpcCode, msg)
-
-	// Добавляем ErrorInfo
-	withInfo, err := st.WithDetails(
-		&errdetails.ErrorInfo{
-			Reason: strconv.Itoa(appErr.Code()),
-			Domain: i.domain,
-		},
-	)
-
-	if err != nil {
-		// Если не удалось добавить детали — возвращаем хотя бы статус
-		return st.Err()
-	}
-
-	// Логируем
-	i.logger.Error("gRPC handler error",
-		"method", method,
-		"message", msg,
-		"cause", appErr.Cause(),
-		"app_code", appErr.Code(),
-		"grpc_code", grpcCode,
-	)
-
-	return withInfo.Err()
+	return codes.Unknown
 }
 
-func httpToGRPCCode(httpCode int) codes.Code {
-	switch httpCode {
-	case 400:
-		return codes.InvalidArgument
-	case 401:
-		return codes.Unauthenticated
-	case 403:
-		return codes.PermissionDenied
-	case 404:
-		return codes.NotFound
-	case 409:
-		return codes.AlreadyExists
-	case 429:
-		return codes.ResourceExhausted
-	case 500:
-		return codes.Internal
-	case 503:
-		return codes.Unavailable
-	default:
-		return codes.Unknown
+func first(arr []string) string {
+	if len(arr) > 0 {
+		return arr[0]
 	}
+	return ""
 }
 
-// GRPCErrorInfo содержит разбор ошибки с сервера
-type GRPCErrorInfo struct {
-	GRPCCode    codes.Code
-	AppCode     int
-	Message     string
-	ErrorDomain string
-}
-
-func ExtractGRPCError(err error) (*GRPCErrorInfo, bool) {
-	if err == nil {
-		return nil, false
-	}
-
+func ExtractAppError(ctx context.Context, err error) *apperror.ApplicationError {
 	st, ok := status.FromError(err)
 	if !ok {
-		// не gRPC ошибка
-		return nil, false
+		return apperror.New(5000, err.Error(), "")
 	}
 
-	info := &GRPCErrorInfo{
-		GRPCCode: st.Code(),
-		Message:  st.Message(),
+	// --- 1. Попытка достать metadata ---
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		code, _ := strconv.Atoi(first(md["app-code"]))
+		message := first(md["app-message"])
+		detail := first(md["app-detail"])
+		return apperror.New(code, message, detail)
 	}
 
-	// пытаемся найти ErrorInfo
-	for _, detail := range st.Details() {
-		if ei, ok := detail.(*errdetails.ErrorInfo); ok {
-			info.AppCode = parseAppCode(ei.Reason)
-			info.ErrorDomain = ei.Domain
-			break
+	var (
+		code    int
+		message string
+		detail  string
+	)
+
+	// --- 2. Попытка достать из status details ---
+	for _, d := range st.Details() {
+		switch info := d.(type) {
+		case *errdetails.ErrorInfo:
+			code, _ = strconv.Atoi(info.Metadata["app-code"])
+			message = st.Message()
+		case *errdetails.DebugInfo:
+			detail = info.Detail
 		}
 	}
 
-	return info, true
-}
-
-func parseAppCode(reason string) int {
-	code, err := strconv.Atoi(reason)
-	if err != nil {
-		return 0
-	}
-	return code
-}
-
-func ExtractAppError(err error) (*apperror.ApplicationError, bool) {
-	info, ok := ExtractGRPCError(err)
-
-	if !ok {
-		return apperror.ErrInternalServerError.Wrap(err), false
-	}
-
-	return apperror.New(info.AppCode, 0, info.Message, "", nil), true
+	return apperror.New(code, message, detail)
 }
